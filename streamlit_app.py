@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="CTD Training Feedback Intelligence", layout="wide")
-st.title("✈️ CTD Training Feedback Intelligence (Hotfix v2)")
+st.title("✈️ CTD Training Feedback Intelligence (Hotfix v3)")
 
 INSTRUCTOR_WHITELIST = [
     "Bogucki, Maciej (BOM)",
@@ -27,7 +27,6 @@ INSTRUCTOR_WHITELIST = [
 HISTORY_DIR = "./history"
 HISTORY_FILE = os.path.join(HISTORY_DIR, "history.csv")
 
-# ---------- Helpers ----------
 def make_unique(cols):
     seen = {}
     out = []
@@ -109,9 +108,29 @@ def parse_dates(df, date_col):
     dmax = s.max() if s.notna().any() else None
     return out, dmin, dmax
 
+def coerce_numeric_block(df, cols):
+    info = {}
+    if not cols:
+        return df, info
+    out = df.copy()
+    for c in cols:
+        before_nonnull = out[c].notna().sum() if c in out.columns else 0
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+        after_nonnull = out[c].notna().sum() if c in out.columns else 0
+        info[c] = {"coerced_nulls": int(before_nonnull - after_nonnull)}
+    return out, info
+
 def compute_flags(dff, rating_cols, threshold):
     dff = dff.copy()
     if rating_cols:
+        dff, info = coerce_numeric_block(dff, rating_cols)
+        bad = {c:v["coerced_nulls"] for c,v in info.items() if v["coerced_nulls"]>0}
+        if bad:
+            st.warning("Some rating cells were text/blank and were ignored: " + ", ".join([f"{k}: {v}" for k,v in bad.items()]))
+        if not any(dff[c].notna().any() for c in rating_cols):
+            dff["_any_leT"] = False
+            dff["_leT_count"] = 0
+            return dff
         dff["_any_leT"] = (dff[rating_cols] <= threshold).any(axis=1)
         dff["_leT_count"] = (dff[rating_cols] <= threshold).sum(axis=1)
     else:
@@ -125,21 +144,17 @@ def stable_anonym_map(names):
 
 def build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, anonymize=False):
     buffer = BytesIO()
-    # Build anon mapping once
     name_map = stable_anonym_map(dff[instructor_col]) if anonymize else {}
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        # Overview
         ov = pd.DataFrame([
             ["Total forms", len(dff)],
             [f"Forms with any mark ≤ {threshold}", int(dff['_any_leT'].sum())],
         ], columns=["Metric","Value"])
         ov.to_excel(writer, sheet_name="Overview", index=False)
 
-        # Overall averages
         overall_avgs = {f"avg|{c}": round(dff[c].mean(), 2) for c in rating_cols} if rating_cols else {}
         pd.DataFrame([{"Total forms": len(dff), f"Forms≤{threshold}(any)": int(dff['_any_leT'].sum()), **overall_avgs}]).to_excel(writer, sheet_name="Overall Averages", index=False)
 
-        # Instructor summary
         inst_series = dff[instructor_col].fillna("Unknown").map(name_map).fillna(dff[instructor_col]) if anonymize else dff[instructor_col].fillna("Unknown")
         grp = dff.groupby(inst_series)
         rows = []
@@ -150,7 +165,6 @@ def build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, a
             rows.append(row)
         pd.DataFrame(rows).to_excel(writer, sheet_name="Instructor Summary", index=False)
 
-        # Yearly stats
         if "_year" in dff.columns and dff["_year"].notna().any():
             dff_local = dff.copy()
             if anonymize:
@@ -162,7 +176,6 @@ def build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, a
                 row = {"Instructor": name, "Year": int(yr), "Forms": len(g), f"Forms≤{threshold}(any)": int(g["_any_leT"].sum())}
                 for c in rating_cols or []:
                     row[f"avg|{c}"] = round(g[c].mean(), 2)
-                # Concatenate comments
                 texts = []
                 for _, r in g.iterrows():
                     for c in note_cols or []:
@@ -173,7 +186,6 @@ def build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, a
                 y_rows.append(row)
             pd.DataFrame(y_rows).to_excel(writer, sheet_name="Yearly Stats", index=False)
 
-        # Comments
         comm_records = []
         for _, r in dff.iterrows():
             texts = []
@@ -188,7 +200,6 @@ def build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, a
                 comm_records.append({"Instructor": name, "LowMarksCount": int(r.get("_leT_count", 0)), "Comments": " | ".join(texts)})
         pd.DataFrame(comm_records).to_excel(writer, sheet_name="Comments", index=False)
 
-        # Raw + flags (with anonymization if toggled)
         raw = dff.copy()
         if anonymize:
             raw[instructor_col] = raw[instructor_col].map(name_map).fillna(raw[instructor_col])
@@ -256,29 +267,31 @@ if uploads:
 
     instructor_col, course_col, location_col, date_col, note_cols, rating_cols = detect_columns(df)
 
-    # Minimal column fixes if auto-detect fails
     with st.expander("Column fixes (optional)", expanded=False):
         instructor_col = st.selectbox("Instructor column", [instructor_col] + [c for c in df.columns if c != instructor_col])
         date_col = st.selectbox("Date column", [date_col] + [c for c in df.columns if c != date_col])
         note_cols = st.multiselect("Note/Comments columns", df.columns.tolist(), default=note_cols)
         rating_cols = st.multiselect("Rating columns (0–10)", [c for c in df.columns if c not in note_cols], default=rating_cols)
 
-    # Parse dates safely
     df, dmin, dmax = parse_dates(df, date_col) if date_col else (df.assign(_date=pd.NaT, _datetime=pd.NaT, _year=np.nan, _month="", _quarter=""), None, None)
 
-    # Whitelist instructors
     if instructor_col:
         df[instructor_col] = df[instructor_col].astype(str)
         df = df[df[instructor_col].isin(INSTRUCTOR_WHITELIST)].copy()
     else:
-        st.error("No Instructor column found. Please set it in 'Column fixes' above.")
+        st.error("No Instructor column found. Please set it in 'Column fixes'.")
         st.stop()
 
     if df.empty:
         st.warning("No rows match the whitelisted instructors. Check name formats in your Excel.")
         st.stop()
 
-    # Optional date filter
+    # Coerce ratings to numeric upfront (prevents TypeError)
+    df, coerced_info = coerce_numeric_block(df, rating_cols)
+    bad = {c:v["coerced_nulls"] for c,v in coerced_info.items() if v["coerced_nulls"]>0}
+    if bad:
+        st.info("Converted some non-numeric rating cells to blank (ignored in averages): " + ", ".join([f"{k}: {v}" for k,v in bad.items()]))
+
     if date_col and df["_date"].notna().any():
         with st.expander("Date filter (optional)", expanded=False):
             mode = st.radio("Mode", ["None", "Range", "By month"], horizontal=True, index=0)
@@ -300,7 +313,7 @@ else:
     instructor_col = date_col = None
     rating_cols = note_cols = []
 
-# ---------- DASHBOARD ----------
+# ---------- Dashboard ----------
 if nav == "Dashboard" and dff is not None:
     st.subheader("Overview")
     c1, c2, c3 = st.columns(3)
@@ -308,7 +321,6 @@ if nav == "Dashboard" and dff is not None:
     c2.metric(f"Forms with any mark ≤ {threshold}", int(dff["_any_leT"].sum()))
     c3.metric("Detected date column", date_col if date_col else "—")
 
-    # Instructor summary
     st.markdown("### Instructor Summary")
     inst_names = dff[instructor_col].fillna("Unknown")
     name_map = stable_anonym_map(inst_names) if anonymize else {}
@@ -323,25 +335,19 @@ if nav == "Dashboard" and dff is not None:
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    # Trends & alerts
     if date_col and (rating_cols or []) and dff["_datetime"].notna().any():
         st.markdown("### Trends & Alerts")
         d_sorted = dff.sort_values("_datetime").copy()
-        # Monthly
         mon_avgs = d_sorted.groupby(d_sorted["_datetime"].dt.to_period("M"))[rating_cols].mean().round(2) if rating_cols else pd.DataFrame()
         if not mon_avgs.empty:
             mon_avgs.index = mon_avgs.index.astype(str)
             st.write("Monthly averages (per metric):")
             st.dataframe(mon_avgs, use_container_width=True)
-
-        # Quarterly
         qtr_avgs = d_sorted.groupby(d_sorted["_datetime"].dt.to_period("Q"))[rating_cols].mean().round(2) if rating_cols else pd.DataFrame()
         if not qtr_avgs.empty:
             qtr_avgs.index = qtr_avgs.index.astype(str)
             st.write("Quarterly averages (per metric):")
             st.dataframe(qtr_avgs, use_container_width=True)
-
-            # Alerts
             alert_lines = []
             if len(qtr_avgs) >= 2:
                 last_q, prev_q = qtr_avgs.iloc[-1], qtr_avgs.iloc[-2]
@@ -357,7 +363,6 @@ if nav == "Dashboard" and dff is not None:
             for line in alert_lines:
                 st.write(line)
 
-    # Comments table
     st.markdown("### Comments (filtered)")
     comm_records = []
     for _, r in dff.iterrows():
@@ -374,7 +379,6 @@ if nav == "Dashboard" and dff is not None:
     comm_df = pd.DataFrame(comm_records)
     st.dataframe(comm_df.sort_values(by=["LowMarksCount"], ascending=False) if not comm_df.empty else pd.DataFrame(columns=["Instructor","LowMarksCount","Comments"]), use_container_width=True)
 
-    # Exports
     st.markdown("### Exports")
     try:
         report_bytes = build_report_excel(dff, rating_cols, note_cols, instructor_col, threshold, anonymize=anonymize)
@@ -387,7 +391,6 @@ if nav == "Dashboard" and dff is not None:
     except Exception as e:
         st.error(f"Export failed: {e}")
 
-    # Save to history
     try:
         if date_col and dff["_month"].notna().any():
             snapshot = pd.DataFrame([{
@@ -397,12 +400,10 @@ if nav == "Dashboard" and dff is not None:
                 "forms_leT": int(dff["_any_leT"].sum()),
                 **({f"avg|{c}": round(dff[c].mean(), 2) for c in rating_cols} if rating_cols else {})
             }])
-            if append_history(snapshot):
-                st.success("Snapshot saved to history.")
+            append_history(snapshot)
     except Exception as e:
         st.info(f"History not saved: {e}")
 
-# ---------- PROFILES ----------
 elif nav == "Instructor Profiles" and dff is not None:
     st.subheader("Instructor Profiles")
     names_sorted = sorted(dff[instructor_col].fillna("Unknown").unique().tolist())
@@ -447,7 +448,6 @@ elif nav == "Instructor Profiles" and dff is not None:
     except Exception as e:
         st.error(f"Export failed: {e}")
 
-# ---------- HISTORY ----------
 elif nav == "History":
     st.subheader("History")
     hist = read_history()
